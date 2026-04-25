@@ -80,7 +80,22 @@ app.use('/api/wordpress', wordpressRoutes);
 
 // Connect to MongoDB
 mongoose.connect(process.env.MONGO_URI)
-.then(() => console.log('MongoDB connected'))
+.then(async () => {
+    console.log('MongoDB connected');
+    // Drop stale indexes from old schema versions
+    try {
+        const db = mongoose.connection.db;
+        const wpProd = db.collection('wordpressproducts');
+        const indexes = await wpProd.indexes();
+        const stale = indexes.find(i => i.name === 'userId_1_integrationId_1_wpProductId_1');
+        if (stale) {
+            await wpProd.dropIndex('userId_1_integrationId_1_wpProductId_1');
+            console.log('[Migration] Dropped stale index userId_1_integrationId_1_wpProductId_1');
+        }
+    } catch (e) {
+        console.warn('[Migration] Index cleanup skipped:', e.message);
+    }
+})
 .catch(err => console.log('MongoDB connection error:', err));
 
 // Handle MongoDB connection errors
