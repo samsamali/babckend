@@ -124,7 +124,7 @@ app.use((err, req, res, next) => {
 
 // Start the server — PORT from Railway env var, fallback 5001.
 const PORT = Number(process.env.PORT) || 5001;
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
 
