@@ -57,6 +57,7 @@ const upsertProduct = async (store, product) => {
                 status:            product.status            || 'publish',
                 date_created:      product.date_created      || '',
                 currency:          product.currency          || 'USD',
+                sellvia_id:        product.sellvia_id        || '',
                 synced_at:         new Date(),
             },
         },
@@ -470,6 +471,7 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                                   ? src.categories.map(c => (typeof c === 'object' ? (c.name || '') : c)).filter(Boolean)
                                   : [],
             image_url:         (Array.isArray(src.images) && src.images[0]?.src) ? src.images[0].src : '',
+            sellvia_id:        src.sellvia_id        || '',
         };
 
         // Push to target WordPress site via plugin
@@ -639,6 +641,7 @@ router.put('/products/:productId', verifyToken, async (req, res) => {
         }
         if (sale_price        !== undefined) updateData.sale_price     = String(sale_price);
         if (stock_quantity    !== undefined) updateData.stock_quantity = Number(stock_quantity);
+        if (req.body.sellvia_id !== undefined) updateData.sellvia_id = req.body.sellvia_id;
 
         // Step 1: Update WordPress via plugin
         if (store.site_url && store.token && store.is_connected) {

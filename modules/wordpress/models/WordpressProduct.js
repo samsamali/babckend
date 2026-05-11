@@ -80,6 +80,10 @@ const wordpressProductSchema = new mongoose.Schema({
         type: String,
         default: '',
     },
+    sellvia_id: {
+        type: String,
+        default: '',
+    },
     currency: {
         type: String,
         default: 'USD',
