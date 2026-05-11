@@ -1,6 +1,14 @@
 const dotenv = require('dotenv');
 dotenv.config();
 
+// Prevent unhandled rejections from crashing the process (Node 20+)
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[UNHANDLED REJECTION]', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[UNCAUGHT EXCEPTION]', err.message, err.stack);
+});
+
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
