@@ -84,6 +84,11 @@ const wordpressProductSchema = new mongoose.Schema({
         type: String,
         default: '',
     },
+    // ← NEW: Links cross-store copies back to original product
+    source_product_id: {
+        type: mongoose.Schema.Types.ObjectId,
+        default: null,
+    },
     currency: {
         type: String,
         default: 'USD',
@@ -98,5 +103,10 @@ const wordpressProductSchema = new mongoose.Schema({
 
 // One product per (store, wp_product_id) — upsert-safe
 wordpressProductSchema.index({ wp_store_id: 1, wp_product_id: 1 }, { unique: true });
+
+// ← NEW INDEXES: For grouping by Sellvia ID and finding copies
+wordpressProductSchema.index({ sellvia_id: 1 });
+wordpressProductSchema.index({ source_product_id: 1 });
+wordpressProductSchema.index({ wp_store_id: 1, synced_at: -1 });
 
 module.exports = mongoose.model('WordpressProduct', wordpressProductSchema);

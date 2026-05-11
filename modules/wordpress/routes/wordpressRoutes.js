@@ -41,6 +41,7 @@ const upsertProduct = async (store, product) => {
                 site_url:          store.site_url,
                 store_name:        store.store_name,
                 wp_product_id:     productId,
+                sellvia_id:        product.sellvia_id || '',  // ← NEW! Sellvia product ID
                 name:              product.name              || '',
                 slug:              product.slug              || '',
                 description:       product.description       || '',
@@ -57,7 +58,6 @@ const upsertProduct = async (store, product) => {
                 status:            product.status            || 'publish',
                 date_created:      product.date_created      || '',
                 currency:          product.currency          || 'USD',
-                sellvia_id:        product.sellvia_id        || '',
                 synced_at:         new Date(),
             },
         },
@@ -203,7 +203,7 @@ router.post('/sync-product', verifyPluginToken, async (req, res) => {
         const store   = req.wpStore;
         const product = req.body.product || req.body;
 
-        console.log('[sync-product] store=', store.store_name, 'id=', product?.id, 'price=', product?.price, 'cats=', product?.categories?.length);
+        console.log('[sync-product] store=', store.store_name, 'id=', product?.id, 'sellvia_id=', product?.sellvia_id, 'price=', product?.price);
 
         if (!product || (product.id == null && product.wp_product_id == null)) {
             return res.status(400).json({ error: 'product.id is required' });
@@ -297,7 +297,7 @@ router.get('/stores/:id/debug', verifyToken, async (req, res) => {
                 headers: { 'X-Marketsync-Token': store.token }, params: { per_page: 1 }, timeout: 15000,
             });
             const p = r.data.data?.[0];
-            result.first_product = { id: p?.id, price: p?.price, images: p?.images?.length, categories: p?.categories };
+            result.first_product = { id: p?.id, price: p?.price, sellvia_id: p?.sellvia_id, images: p?.images?.length, categories: p?.categories };
         } catch (e) { result.products_error = e.message; }
         res.json(result);
     } catch (error) {
@@ -306,7 +306,7 @@ router.get('/stores/:id/debug', verifyToken, async (req, res) => {
 });
 
 // ================================================================
-//  PROTECTED — Products list + categories
+//  PROTECTED — Products list + categories (Grouped by sellvia_id!)
 // ================================================================
 router.get('/products/categories', verifyToken, async (req, res) => {
     try {
@@ -320,15 +320,20 @@ router.get('/products/categories', verifyToken, async (req, res) => {
     }
 });
 
+// ── NEW! Group products by sellvia_id ──────────────────────────────────────
 router.get('/products', verifyToken, async (req, res) => {
     try {
         const { store_id, page = 1, per_page = 20, search, category } = req.query;
         const filter = {};
 
+        // If store_id specified, find products from that store
+        // Otherwise show products grouped by sellvia_id across all stores
+        const storeFilter = {};
         if (store_id && store_id !== 'all') {
-            try { filter.wp_store_id = new mongoose.Types.ObjectId(store_id); }
-            catch (_) { filter.wp_store_id = store_id; }
+            try { storeFilter.wp_store_id = new mongoose.Types.ObjectId(store_id); }
+            catch (_) { storeFilter.wp_store_id = store_id; }
         }
+
         if (search?.trim()) {
             const regex = { $regex: search.trim(), $options: 'i' };
             filter.$or = [{ name: regex }, { 'categories.name': regex }];
@@ -341,8 +346,30 @@ router.get('/products', verifyToken, async (req, res) => {
         const parsedLimit = Math.min(100, Math.max(1, parseInt(per_page)));
         const skip = (parsedPage - 1) * parsedLimit;
 
+        // ── Group by sellvia_id if no specific store, otherwise group by _id ──
+        const groupId = store_id && store_id !== 'all' ? '$_id' : { $cond: [{ $ne: ['$sellvia_id', ''] }, '$sellvia_id', '$_id'] };
+
         const pipeline = [
-            { $match: filter },
+            { $match: { ...filter, ...storeFilter } },
+            {
+                $group: {
+                    _id: groupId,
+                    sellvia_id: { $first: '$sellvia_id' },
+                    wp_product_id: { $first: '$wp_product_id' },
+                    doc_id: { $first: '$_id' },
+                    name: { $first: '$name' },
+                    price: { $first: '$price' },
+                    stock_quantity: { $first: '$stock_quantity' },
+                    images: { $first: '$images' },
+                    categories: { $first: '$categories' },
+                    synced_at: { $first: '$synced_at' },
+                    store_name: { $first: '$store_name' },
+                    site_url: { $first: '$site_url' },
+                    // Count stores that have this product
+                    store_count: { $sum: 1 },
+                    stores: { $push: { store_id: '$wp_store_id', store_name: '$store_name', wp_product_id: '$wp_product_id' } },
+                }
+            },
             { $addFields: { _rank: { $cond: [{ $gt: [{ $size: { $ifNull: ['$images', []] } }, 0] }, 1, 0] } } },
             { $sort: { _rank: -1, synced_at: -1 } },
             { $skip: skip },
@@ -352,45 +379,41 @@ router.get('/products', verifyToken, async (req, res) => {
 
         const [products, total] = await Promise.all([
             WordpressProduct.aggregate(pipeline),
-            WordpressProduct.countDocuments(filter),
+            WordpressProduct.countDocuments({ ...filter, ...storeFilter }),
         ]);
 
         res.json({ success: true, data: products, total, total_pages: Math.ceil(total / parsedLimit), page: parsedPage, per_page: parsedLimit });
     } catch (error) {
+        console.error('[products] error:', error);
         res.status(500).json({ error: 'Failed to fetch products' });
     }
 });
 
 // ================================================================
-//  PROTECTED — Store distribution: which stores have this product
+//  PROTECTED — Store distribution by sellvia_id
 // ================================================================
 router.get('/products/:productId/store-status', verifyToken, async (req, res) => {
     try {
         const product = await WordpressProduct.findById(req.params.productId);
         if (!product) return res.status(404).json({ error: 'Product not found' });
 
-        // Resolve the canonical source ID:
-        // - If this product was assigned FROM another, source_product_id points to the original
-        // - Otherwise this product IS the source
-        const sourceId = product.source_product_id
-            ? String(product.source_product_id)
-            : String(product._id);
+        // Group by sellvia_id if available, otherwise by _id
+        const groupKey = product.sellvia_id ? product.sellvia_id : String(product._id);
 
-        const [stores, assignments] = await Promise.all([
+        const [stores, productsWithKey] = await Promise.all([
             WordpressStore.find({}).sort({ store_name: 1 }),
             WordpressProduct.find({
                 $or: [
-                    // The source product itself (on its original store)
-                    { _id: sourceId },
-                    // Copies assigned from this source to other stores
-                    { source_product_id: sourceId },
+                    ...(product.sellvia_id ? [{ sellvia_id: product.sellvia_id }] : []),
+                    { _id: product._id },
+                    { source_product_id: product._id },
                 ],
-            }).select('wp_store_id _id'),
+            }).select('wp_store_id sellvia_id _id wp_product_id'),
         ]);
 
         const assignedMap = {};
-        for (const a of assignments) {
-            assignedMap[String(a.wp_store_id)] = String(a._id);
+        for (const p of productsWithKey) {
+            assignedMap[String(p.wp_store_id)] = String(p._id);
         }
 
         const storeStatus = stores.map(s => ({
@@ -402,7 +425,7 @@ router.get('/products/:productId/store-status', verifyToken, async (req, res) =>
             product_doc_id: assignedMap[String(s._id)] || null,
         }));
 
-        res.json({ success: true, stores: storeStatus, wp_product_id: product.wp_product_id });
+        res.json({ success: true, stores: storeStatus, group_key: groupKey, wp_product_id: product.wp_product_id });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -439,7 +462,7 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                     const fp = freshRes.data?.data;
                     if (fp && parseFloat(fp.price) > 0) {
                         src = fp;
-                        console.log(`[assign] fresh price=${src.price} qty=${src.stock_quantity}`);
+                        console.log(`[assign] fresh price=${src.price} qty=${src.stock_quantity} sellvia_id=${src.sellvia_id}`);
                     }
                 }
             } catch (freshErr) {
@@ -447,12 +470,11 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
             }
         }
 
-        // Build full payload — Sellvia regular_price is often "0", fall back to price
+        // Build full payload
         const isSellvia      = src.platform === 'sellvia' || product.platform === 'sellvia';
         const effectivePrice   = parseFloat(src.price)         > 0 ? String(src.price)         : '0';
         const effectiveRegular = parseFloat(src.regular_price) > 0 ? String(src.regular_price) : effectivePrice;
         const effectiveSale    = parseFloat(src.sale_price)    > 0 ? String(src.sale_price)    : '';
-        // Sellvia products have unlimited stock — default 1000000 if DB has 0/null
         const effectiveQty     = parseInt(src.stock_quantity)  > 0
             ? Number(src.stock_quantity)
             : (isSellvia ? 1000000 : null);
@@ -471,12 +493,12 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                                   ? src.categories.map(c => (typeof c === 'object' ? (c.name || '') : c)).filter(Boolean)
                                   : [],
             image_url:         (Array.isArray(src.images) && src.images[0]?.src) ? src.images[0].src : '',
-            sellvia_id:        src.sellvia_id        || '',
+            sellvia_id:        src.sellvia_id        || '',  // ← NEW!
         };
 
         // Push to target WordPress site via plugin
         const wpUrl = `${targetStore.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products`;
-        console.log(`[assign] Calling WP POST → ${wpUrl} | name="${payload.name}" price=${payload.price} qty=${payload.stock_quantity}`);
+        console.log(`[assign] Calling WP POST → ${wpUrl} | name="${payload.name}" price=${payload.price} qty=${payload.stock_quantity} sellvia_id=${payload.sellvia_id}`);
 
         let wpProductId = null;
         try {
@@ -521,6 +543,7 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                     wp_product_id:     wpProductId,
                     store_name:        targetStore.store_name,
                     site_url:          targetStore.site_url,
+                    sellvia_id:        payload.sellvia_id,  // ← NEW!
                     synced_at:         new Date(),
                 },
             },
@@ -551,7 +574,7 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
 
         // Find the actual document that lives on the target store.
         // If the passed product belongs to a different store (cross-store remove),
-        // look up the assigned copy via source_product_id.
+        // look up the assigned copy via source_product_id or sellvia_id.
         let docToRemove = product;
         if (String(product.wp_store_id) !== String(store._id)) {
             const sourceId = product.source_product_id
@@ -563,11 +586,11 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
                 $or: [
                     { source_product_id: sourceId },
                     { source_product_id: String(product._id) },
+                    ...(product.sellvia_id ? [{ sellvia_id: product.sellvia_id }] : []),
                 ],
             });
 
             if (!copy) {
-                // Already removed from MongoDB — just update count
                 const count = await WordpressProduct.countDocuments({ wp_store_id: store._id });
                 await WordpressStore.updateOne({ _id: store._id }, { $set: { total_products_cached: count } });
                 return res.json({ success: true, wp_deleted: false, note: 'No copy found in store' });
@@ -591,7 +614,7 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
                 const status = wpErr.response?.status;
                 wpError = wpErr.response?.data || wpErr.message;
                 console.error(`[remove] WP DELETE failed status=${status}`, wpError);
-                if (status === 404) wpDeleted = true; // already gone on WP
+                if (status === 404) wpDeleted = true;
             }
         } else {
             wpDeleted = true;
@@ -604,7 +627,6 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
             });
         }
 
-        // Delete the copy document from MongoDB
         await WordpressProduct.findByIdAndDelete(docToRemove._id);
 
         const count = await WordpressProduct.countDocuments({ wp_store_id: store._id });
@@ -641,7 +663,6 @@ router.put('/products/:productId', verifyToken, async (req, res) => {
         }
         if (sale_price        !== undefined) updateData.sale_price     = String(sale_price);
         if (stock_quantity    !== undefined) updateData.stock_quantity = Number(stock_quantity);
-        if (req.body.sellvia_id !== undefined) updateData.sellvia_id = req.body.sellvia_id;
 
         // Step 1: Update WordPress via plugin
         if (store.site_url && store.token && store.is_connected) {
