@@ -111,7 +111,7 @@ app.use((err, req, res, next) => {
     res.status(500).json({ message: 'Internal Server Error' });
 });
 
-// Start the server on a fixed port so frontend/backed stay aligned.
+// Start the server — PORT from Railway env var, fallback 5001.
 const PORT = Number(process.env.PORT) || 5001;
 const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
