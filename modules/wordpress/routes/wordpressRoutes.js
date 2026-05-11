@@ -354,33 +354,53 @@ router.get('/products', verifyToken, async (req, res) => {
             {
                 $group: {
                     _id: groupId,
-                    sellvia_id: { $first: '$sellvia_id' },
+                    sellvia_id:    { $first: '$sellvia_id' },
                     wp_product_id: { $first: '$wp_product_id' },
-                    doc_id: { $first: '$_id' },
-                    name: { $first: '$name' },
-                    price: { $first: '$price' },
-                    stock_quantity: { $first: '$stock_quantity' },
-                    images: { $first: '$images' },
-                    categories: { $first: '$categories' },
-                    synced_at: { $first: '$synced_at' },
-                    store_name: { $first: '$store_name' },
-                    site_url: { $first: '$site_url' },
-                    // Count stores that have this product
+                    doc_id:        { $first: '$_id' },
+                    name:              { $first: '$name' },
+                    description:       { $first: '$description' },
+                    short_description: { $first: '$short_description' },
+                    sku:               { $first: '$sku' },
+                    price:             { $first: '$price' },
+                    regular_price:     { $first: '$regular_price' },
+                    sale_price:        { $first: '$sale_price' },
+                    stock_status:      { $first: '$stock_status' },
+                    stock_quantity:    { $first: '$stock_quantity' },
+                    images:            { $first: '$images' },
+                    categories:        { $first: '$categories' },
+                    tags:              { $first: '$tags' },
+                    status:            { $first: '$status' },
+                    currency:          { $first: '$currency' },
+                    synced_at:         { $first: '$synced_at' },
+                    store_name:        { $first: '$store_name' },
+                    site_url:          { $first: '$site_url' },
+                    wp_store_id:       { $first: '$wp_store_id' },
                     store_count: { $sum: 1 },
                     stores: { $push: { store_id: '$wp_store_id', store_name: '$store_name', wp_product_id: '$wp_product_id' } },
                 }
             },
-            { $addFields: { _rank: { $cond: [{ $gt: [{ $size: { $ifNull: ['$images', []] } }, 0] }, 1, 0] } } },
+            { $addFields: {
+                _id:   '$doc_id',
+                _rank: { $cond: [{ $gt: [{ $size: { $ifNull: ['$images', []] } }, 0] }, 1, 0] },
+            }},
             { $sort: { _rank: -1, synced_at: -1 } },
             { $skip: skip },
             { $limit: parsedLimit },
-            { $project: { _rank: 0 } },
+            { $project: { _rank: 0, doc_id: 0 } },
         ];
 
-        const [products, total] = await Promise.all([
+        // Count distinct groups (not raw docs) for correct pagination
+        const countPipeline = [
+            { $match: { ...filter, ...storeFilter } },
+            { $group: { _id: groupId } },
+            { $count: 'total' },
+        ];
+
+        const [products, countResult] = await Promise.all([
             WordpressProduct.aggregate(pipeline),
-            WordpressProduct.countDocuments({ ...filter, ...storeFilter }),
+            WordpressProduct.aggregate(countPipeline),
         ]);
+        const total = countResult[0]?.total ?? 0;
 
         res.json({ success: true, data: products, total, total_pages: Math.ceil(total / parsedLimit), page: parsedPage, per_page: parsedLimit });
     } catch (error) {
