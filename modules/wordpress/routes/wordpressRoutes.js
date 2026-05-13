@@ -41,7 +41,7 @@ const upsertProduct = async (store, product) => {
                 site_url:          store.site_url,
                 store_name:        store.store_name,
                 wp_product_id:     productId,
-                sellvia_id:        product.sellvia_id || '',  // ← NEW! Sellvia product ID
+                sellvia_id:        product.sellvia_id || '',
                 name:              product.name              || '',
                 slug:              product.slug              || '',
                 description:       product.description       || '',
@@ -320,14 +320,12 @@ router.get('/products/categories', verifyToken, async (req, res) => {
     }
 });
 
-// ── NEW! Group products by sellvia_id ──────────────────────────────────────
+// ── Group products by sellvia_id ──────────────────────────────────────────────
 router.get('/products', verifyToken, async (req, res) => {
     try {
         const { store_id, page = 1, per_page = 20, search, category } = req.query;
         const filter = {};
 
-        // If store_id specified, find products from that store
-        // Otherwise show products grouped by sellvia_id across all stores
         const storeFilter = {};
         if (store_id && store_id !== 'all') {
             try { storeFilter.wp_store_id = new mongoose.Types.ObjectId(store_id); }
@@ -346,7 +344,6 @@ router.get('/products', verifyToken, async (req, res) => {
         const parsedLimit = Math.min(100, Math.max(1, parseInt(per_page)));
         const skip = (parsedPage - 1) * parsedLimit;
 
-        // ── Group by sellvia_id if no specific store, otherwise group by _id ──
         const groupId = store_id && store_id !== 'all' ? '$_id' : { $cond: [{ $ne: ['$sellvia_id', ''] }, '$sellvia_id', '$_id'] };
 
         const pipeline = [
@@ -389,7 +386,6 @@ router.get('/products', verifyToken, async (req, res) => {
             { $project: { _rank: 0, doc_id: 0 } },
         ];
 
-        // Count distinct groups (not raw docs) for correct pagination
         const countPipeline = [
             { $match: { ...filter, ...storeFilter } },
             { $group: { _id: groupId } },
@@ -417,7 +413,6 @@ router.get('/products/:productId/store-status', verifyToken, async (req, res) =>
         const product = await WordpressProduct.findById(req.params.productId);
         if (!product) return res.status(404).json({ error: 'Product not found' });
 
-        // Group by sellvia_id if available, otherwise by _id
         const groupKey = product.sellvia_id ? product.sellvia_id : String(product._id);
 
         const [stores, productsWithKey] = await Promise.all([
@@ -453,6 +448,7 @@ router.get('/products/:productId/store-status', verifyToken, async (req, res) =>
 
 // ================================================================
 //  PROTECTED — Assign (copy) a product to another store
+//  ⭐ NEW: Uses Sellvia native import when sellvia_id exists
 // ================================================================
 router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res) => {
     try {
@@ -467,88 +463,127 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
             return res.status(400).json({ error: 'Target store is not connected' });
         }
 
-        // If MongoDB has stale/zero price, fetch fresh data from the source WP store
-        let src = product;
-        if (parseFloat(product.price) <= 0) {
+        let wpProductId = null;
+        let importMethod = 'manual';
+
+        // ════════════════════════════════════════════════════════════
+        //  PRIORITY 1: Sellvia Native Import (if sellvia_id exists)
+        //  This creates a proper Sellvia-connected product
+        //  → Public URL works ✅
+        //  → wp_slv_products entry created ✅
+        //  → Sellvia features active ✅
+        // ════════════════════════════════════════════════════════════
+        if (product.sellvia_id) {
             try {
-                const sourceStore = await WordpressStore.findById(product.wp_store_id);
-                if (sourceStore?.site_url && sourceStore?.token && product.wp_product_id) {
-                    const freshUrl = `${sourceStore.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products/${product.wp_product_id}`;
-                    console.log(`[assign] price=0 in DB — fetching fresh from source: ${freshUrl}`);
-                    const freshRes = await axios.get(freshUrl, {
-                        headers: { 'X-Marketsync-Token': sourceStore.token },
-                        timeout: 15000,
-                    });
-                    const fp = freshRes.data?.data;
-                    if (fp && parseFloat(fp.price) > 0) {
-                        src = fp;
-                        console.log(`[assign] fresh price=${src.price} qty=${src.stock_quantity} sellvia_id=${src.sellvia_id}`);
-                    }
+                const sellviaImportUrl = `${targetStore.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/sellvia-import`;
+                console.log(`[assign] 🎯 Trying Sellvia native import → sellvia_id=${product.sellvia_id}`);
+
+                const sellviaRes = await axios.post(sellviaImportUrl, {
+                    sellvia_id: product.sellvia_id,
+                    name:       product.name,
+                }, {
+                    headers: {
+                        'X-Marketsync-Token': targetStore.token,
+                        'Content-Type':       'application/json',
+                    },
+                    timeout: 60000,
+                });
+
+                if (sellviaRes.data?.success && sellviaRes.data?.wp_product_id) {
+                    wpProductId = sellviaRes.data.wp_product_id;
+                    importMethod = 'sellvia';
+                    console.log(`[assign] ✅ Sellvia import SUCCESS! wp_product_id=${wpProductId}`);
+                } else {
+                    console.warn('[assign] ⚠️ Sellvia import returned unexpected response:', sellviaRes.data);
                 }
-            } catch (freshErr) {
-                console.warn('[assign] Fresh price fetch failed:', freshErr.message);
+            } catch (sellviaErr) {
+                console.warn('[assign] ⚠️ Sellvia import failed, falling back to manual:',
+                    sellviaErr.response?.data || sellviaErr.message);
             }
         }
 
-        // Build full payload
-        const isSellvia      = src.platform === 'sellvia' || product.platform === 'sellvia';
-        const effectivePrice   = parseFloat(src.price)         > 0 ? String(src.price)         : '0';
-        const effectiveRegular = parseFloat(src.regular_price) > 0 ? String(src.regular_price) : effectivePrice;
-        const effectiveSale    = parseFloat(src.sale_price)    > 0 ? String(src.sale_price)    : '';
-        const effectiveQty     = parseInt(src.stock_quantity)  > 0
-            ? Number(src.stock_quantity)
-            : (isSellvia ? 1000000 : null);
+        // ════════════════════════════════════════════════════════════
+        //  PRIORITY 2: Manual Import (fallback)
+        //  Used when no sellvia_id, or Sellvia import failed
+        // ════════════════════════════════════════════════════════════
+        if (!wpProductId) {
+            let src = product;
 
-        const payload = {
-            name:              src.name              || '',
-            description:       src.description       || '',
-            short_description: src.short_description || '',
-            sku:               src.sku               || '',
-            price:             effectivePrice,
-            regular_price:     effectiveRegular,
-            sale_price:        effectiveSale,
-            stock_status:      src.stock_status      || 'instock',
-            stock_quantity:    effectiveQty,
-            categories:        Array.isArray(src.categories)
-                                  ? src.categories.map(c => (typeof c === 'object' ? (c.name || '') : c)).filter(Boolean)
-                                  : [],
-            image_url:         (Array.isArray(src.images) && src.images[0]?.src) ? src.images[0].src : '',
-            sellvia_id:        src.sellvia_id        || '',  // ← NEW!
-        };
+            // Refresh data if stale
+            if (parseFloat(product.price) <= 0) {
+                try {
+                    const sourceStore = await WordpressStore.findById(product.wp_store_id);
+                    if (sourceStore?.site_url && sourceStore?.token && product.wp_product_id) {
+                        const freshUrl = `${sourceStore.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products/${product.wp_product_id}`;
+                        const freshRes = await axios.get(freshUrl, {
+                            headers: { 'X-Marketsync-Token': sourceStore.token },
+                            timeout: 15000,
+                        });
+                        const fp = freshRes.data?.data;
+                        if (fp && parseFloat(fp.price) > 0) src = fp;
+                    }
+                } catch (freshErr) {
+                    console.warn('[assign] Fresh fetch failed:', freshErr.message);
+                }
+            }
 
-        // Push to target WordPress site via plugin
-        const wpUrl = `${targetStore.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products`;
-        console.log(`[assign] Calling WP POST → ${wpUrl} | name="${payload.name}" price=${payload.price} qty=${payload.stock_quantity} sellvia_id=${payload.sellvia_id}`);
+            const isSellvia        = src.platform === 'sellvia' || product.platform === 'sellvia';
+            const effectivePrice   = parseFloat(src.price)         > 0 ? String(src.price)         : '0';
+            const effectiveRegular = parseFloat(src.regular_price) > 0 ? String(src.regular_price) : effectivePrice;
+            const effectiveSale    = parseFloat(src.sale_price)    > 0 ? String(src.sale_price)    : '';
+            const effectiveQty     = parseInt(src.stock_quantity)  > 0
+                ? Number(src.stock_quantity)
+                : (isSellvia ? 1000000 : null);
 
-        let wpProductId = null;
-        try {
-            const wpRes = await axios.post(wpUrl, payload, {
-                headers: {
-                    'X-Marketsync-Token': targetStore.token,
-                    'Content-Type':       'application/json',
-                },
-                timeout: 30000,
-            });
-            console.log(`[assign] WP response:`, JSON.stringify(wpRes.data).slice(0, 300));
-            wpProductId = wpRes.data?.data?.id || null;
-        } catch (wpErr) {
-            const errBody = wpErr.response?.data || wpErr.message;
-            console.error(`[assign] WP POST failed:`, errBody);
-            return res.status(502).json({
-                error: 'Failed to create product on WordPress site',
-                wp_error: errBody,
-            });
+            const payload = {
+                name:              src.name              || '',
+                description:       src.description       || '',
+                short_description: src.short_description || '',
+                sku:               src.sku               || '',
+                price:             effectivePrice,
+                regular_price:     effectiveRegular,
+                sale_price:        effectiveSale,
+                stock_status:      src.stock_status      || 'instock',
+                stock_quantity:    effectiveQty,
+                categories:        Array.isArray(src.categories)
+                                      ? src.categories.map(c => (typeof c === 'object' ? (c.name || '') : c)).filter(Boolean)
+                                      : [],
+                image_url:         (Array.isArray(src.images) && src.images[0]?.src) ? src.images[0].src : '',
+                sellvia_id:        src.sellvia_id        || '',
+            };
+
+            const wpUrl = `${targetStore.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products`;
+            console.log(`[assign] 📝 Manual import → ${wpUrl} | name="${payload.name}"`);
+
+            try {
+                const wpRes = await axios.post(wpUrl, payload, {
+                    headers: {
+                        'X-Marketsync-Token': targetStore.token,
+                        'Content-Type':       'application/json',
+                    },
+                    timeout: 30000,
+                });
+                wpProductId = wpRes.data?.data?.id || null;
+                importMethod = 'manual';
+                console.log(`[assign] ✅ Manual import success! wp_product_id=${wpProductId}`);
+            } catch (wpErr) {
+                const errBody = wpErr.response?.data || wpErr.message;
+                console.error(`[assign] ❌ Manual import failed:`, errBody);
+                return res.status(502).json({
+                    error: 'Failed to create product on WordPress site',
+                    wp_error: errBody,
+                });
+            }
         }
 
         if (!wpProductId) {
-            return res.status(502).json({ error: 'WordPress did not return a product ID' });
+            return res.status(502).json({ error: 'Could not create product on target store' });
         }
 
-        // Save to MongoDB with the NEW WP product ID returned by plugin
+        // Save to MongoDB
         const data = product.toObject();
         delete data._id; delete data.__v; delete data.created_at; delete data.updated_at;
 
-        // source_product_id links this copy back to the original so store-status can find it
         const sourceProductId = product.source_product_id
             ? String(product.source_product_id)
             : String(product._id);
@@ -563,7 +598,7 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                     wp_product_id:     wpProductId,
                     store_name:        targetStore.store_name,
                     site_url:          targetStore.site_url,
-                    sellvia_id:        payload.sellvia_id,  // ← NEW!
+                    sellvia_id:        product.sellvia_id || '',
                     synced_at:         new Date(),
                 },
             },
@@ -573,7 +608,12 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
         const count = await WordpressProduct.countDocuments({ wp_store_id: targetStore._id });
         await WordpressStore.updateOne({ _id: targetStore._id }, { $set: { total_products_cached: count } });
 
-        res.json({ success: true, product: saved, wp_product_id: wpProductId });
+        res.json({
+            success:        true,
+            product:        saved,
+            wp_product_id:  wpProductId,
+            import_method:  importMethod,   // 'sellvia' or 'manual'
+        });
     } catch (error) {
         console.error('[assign] error:', error);
         res.status(500).json({ error: error.message });
@@ -592,9 +632,6 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
         if (!product) return res.status(404).json({ error: 'Product not found' });
         if (!store)   return res.status(404).json({ error: 'Store not found' });
 
-        // Find the actual document that lives on the target store.
-        // If the passed product belongs to a different store (cross-store remove),
-        // look up the assigned copy via source_product_id or sellvia_id.
         let docToRemove = product;
         if (String(product.wp_store_id) !== String(store._id)) {
             const sourceId = product.source_product_id
@@ -618,7 +655,6 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
             docToRemove = copy;
         }
 
-        // Delete from WordPress using the TARGET store's WP product ID
         let wpDeleted = false;
         let wpError   = null;
         if (store.site_url && store.token) {
@@ -684,7 +720,6 @@ router.put('/products/:productId', verifyToken, async (req, res) => {
         if (sale_price        !== undefined) updateData.sale_price     = String(sale_price);
         if (stock_quantity    !== undefined) updateData.stock_quantity = Number(stock_quantity);
 
-        // Step 1: Update WordPress via plugin
         if (store.site_url && store.token && store.is_connected) {
             const wpUrl = `${store.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products/${product.wp_product_id}`;
             console.log(`[update] WP PUT → ${wpUrl}`);
@@ -703,7 +738,6 @@ router.put('/products/:productId', verifyToken, async (req, res) => {
             }
         }
 
-        // Step 2: Update MongoDB
         Object.assign(product, updateData);
         product.synced_at = new Date();
         await product.save();
