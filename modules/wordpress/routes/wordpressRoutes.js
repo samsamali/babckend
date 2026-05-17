@@ -500,30 +500,34 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                 }
 
                 if (preparedPostId) {
-                    // STEP 2: Connect — loopback to admin-ajax.php (synchronous).
-                    // Connect now does the real work + finalize itself.
-                    let connectSaysConnected = false;
+                    // STEP 2: Connect — loopback to Sellvia's own REST install
+                    // route. Connect locates Sellvia's connected post itself
+                    // and returns its real wp_product_id.
+                    let connectedPostId = null;
                     try {
                         const connectRes = await axios.post(
                             `${base}/wp-json/marketsync/v1/sellvia-import-connect`,
                             { post_id: preparedPostId, sellvia_id: product.sellvia_id },
-                            { headers, timeout: 90000 }
+                            { headers, timeout: 120000 }
                         );
                         const cd = connectRes.data || {};
-                        connectSaysConnected = !!cd.connected;
-                        console.log(`[assign]   step2 connect → connected=${cd.connected} slv_entry=${cd.slv_entry || 'none'}`);
-                        console.log(`[assign]   step2 diagnostics: ${JSON.stringify(cd.diagnostics || {}).slice(0, 400)}`);
+                        console.log(`[assign]   step2 connect → connected=${cd.connected} post_id=${cd.wp_product_id || cd.post_id || '?'} slv_entry=${cd.slv_entry || 'none'} method=${cd.method || '?'}`);
+                        console.log(`[assign]   step2 diagnostics: ${JSON.stringify(cd.diagnostics || {}).slice(0, 500)}`);
+                        if (cd.connected && cd.wp_product_id) {
+                            connectedPostId = cd.wp_product_id;
+                        }
                     } catch (connectErr) {
-                        console.log(`[assign]   step2 connect → error: ${JSON.stringify(connectErr.response?.data || connectErr.message).slice(0, 250)}`);
+                        console.log(`[assign]   step2 connect → error: ${JSON.stringify(connectErr.response?.data || connectErr.message).slice(0, 300)}`);
                     }
 
-                    // Brief pause, then verify as the final word
+                    // Brief pause, then verify the post connect identified
                     await new Promise(r => setTimeout(r, 1500));
 
-                    // STEP 3: Verify — confirm connection (deletes draft if failed)
+                    // STEP 3: Verify — confirm the REAL post is slv-connected
+                    const verifyId = connectedPostId || preparedPostId;
                     try {
                         const verifyRes = await axios.get(
-                            `${base}/wp-json/marketsync/v1/sellvia-import-verify/${preparedPostId}`,
+                            `${base}/wp-json/marketsync/v1/sellvia-import-verify/${verifyId}`,
                             { headers, timeout: 30000 }
                         );
                         const vd = verifyRes.data || {};
