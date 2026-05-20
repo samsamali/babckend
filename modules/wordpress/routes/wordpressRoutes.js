@@ -484,6 +484,83 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
 
                 console.log(`[assign] 🎯 Sellvia import (3-step) → sellvia_id=${product.sellvia_id}`);
 
+                // Build the product payload from MongoDB data the backend
+                // ALREADY has (synced from source store) — image, price,
+                // description. This does NOT depend on Sellvia's encrypted API.
+                const imgUrl = (Array.isArray(product.images) && product.images[0])
+                    ? (product.images[0].src || product.images[0].url || '') : '';
+                const allImgs = (Array.isArray(product.images) ? product.images : [])
+                    .map(i => (i && (i.src || i.url)) ? (i.src || i.url) : null)
+                    .filter(Boolean);
+                const productPayload = {
+                    sellvia_id:        product.sellvia_id,
+                    name:              product.name || '',
+                    description:       product.description || '',
+                    short_description: product.short_description || '',
+                    price:             String(product.price ?? '0'),
+                    regular_price:     String(product.regular_price ?? product.price ?? '0'),
+                    image_url:         imgUrl,
+                    images:            allImgs,
+                    categories:        Array.isArray(product.categories) ? product.categories : [],
+                };
+
+                // DIAGNOSTIC: show exactly what data MongoDB has for this product
+                console.log(`[assign] 📦 source data → price=${productPayload.price} regular=${productPayload.regular_price} img=${imgUrl ? 'YES' : 'NO'} imgs=${allImgs.length} name="${(productPayload.name||'').slice(0,40)}"`);
+
+                // If this product's data is incomplete (price 0 OR no image),
+                // find ANOTHER copy of the same product (same sellvia_id, or
+                // same source_product_id) that DOES have good data. All
+                // cross-store copies share the same Sellvia product.
+                const needsFresh = (parseFloat(productPayload.price) <= 0) || !imgUrl;
+                if (needsFresh) {
+                    try {
+                        const orConds = [];
+                        if (product.sellvia_id) orConds.push({ sellvia_id: product.sellvia_id });
+                        if (product.source_product_id) {
+                            orConds.push({ _id: product.source_product_id });
+                            orConds.push({ source_product_id: product.source_product_id });
+                        }
+                        orConds.push({ source_product_id: product._id });
+
+                        const siblings = await WordpressProduct.find({
+                            $or: orConds,
+                            _id: { $ne: product._id },
+                        }).lean();
+
+                        // Pick the sibling with a positive price AND an image
+                        let best = null;
+                        for (const s of siblings) {
+                            const sImg = (Array.isArray(s.images) && s.images[0])
+                                ? (s.images[0].src || s.images[0].url || '') : '';
+                            const sPrice = parseFloat(s.price);
+                            if (sPrice > 0 && sImg) { best = s; break; }
+                            if (!best && (sPrice > 0 || sImg)) best = s;
+                        }
+
+                        if (best) {
+                            const bImgs = (Array.isArray(best.images) ? best.images : [])
+                                .map(i => (i && (i.src || i.url)) || null).filter(Boolean);
+                            if (parseFloat(best.price) > 0) {
+                                productPayload.price = String(best.price);
+                                productPayload.regular_price =
+                                    String(best.regular_price || best.price);
+                            }
+                            if (bImgs.length) {
+                                productPayload.image_url = bImgs[0];
+                                productPayload.images = bImgs;
+                            }
+                            if (best.description && !productPayload.description) {
+                                productPayload.description = best.description;
+                            }
+                            console.log(`[assign] 🔄 used sibling copy → price=${productPayload.price} imgs=${bImgs.length} (from ${siblings.length} copies)`);
+                        } else {
+                            console.warn(`[assign] ⚠️ no sibling copy with good data (${siblings.length} copies checked) — product's source data is incomplete`);
+                        }
+                    } catch (sibErr) {
+                        console.warn(`[assign] ⚠️ sibling lookup failed: ${sibErr.message}`);
+                    }
+                }
+
                 // STEP 1: Prepare — get a clean post_id (no Sellvia call, safe)
                 let preparedPostId = null;
                 try {
@@ -507,7 +584,8 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                     try {
                         const connectRes = await axios.post(
                             `${base}/wp-json/marketsync/v1/sellvia-import-connect`,
-                            { post_id: preparedPostId, sellvia_id: product.sellvia_id },
+                            { post_id: preparedPostId, sellvia_id: product.sellvia_id,
+                              product: productPayload },
                             { headers, timeout: 120000 }
                         );
                         const cd = connectRes.data || {};
